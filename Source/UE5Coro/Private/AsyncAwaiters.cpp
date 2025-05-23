@@ -169,8 +169,9 @@ void FNewThreadAwaiter::Suspend(FPromise& Promise)
 	new FAutoStartResumeRunnable(Promise, Priority, Affinity, Flags);
 }
 
-FDelegateAwaiter::FDelegateAwaiter()
-	: TCancelableAwaiter(&Cancel)
+FDelegateAwaiter::FDelegateAwaiter(
+	std::function<void()> (*Prepare)(FDelegateAwaiter*))
+	: TCancelableAwaiter(&Cancel), Prepare(Prepare)
 {
 }
 
@@ -184,15 +185,16 @@ FDelegateAwaiter::~FDelegateAwaiter()
 void FDelegateAwaiter::Suspend(FPromise& InPromise)
 {
 	checkf(!Promise, TEXT("Internal error: unexpected double suspend"));
-	checkf(Cleanup, TEXT("Internal error: awaiter not set up"));
+	checkf(!Cleanup, TEXT("Internal error: unexpected awaiter reuse"));
 	UE::TUniqueLock Lock(InPromise.GetLock());
 	if (InPromise.RegisterCancelableAwaiter(this))
-		Promise = &InPromise;
-	else
 	{
-		Cleanup();
-		FAsyncYieldAwaiter::Suspend(InPromise);
+		Cleanup = (*Prepare)(this);
+		checkf(Cleanup, TEXT("Internal error: awaiter was not set up"));
+		Promise = &InPromise;
 	}
+	else
+		FAsyncYieldAwaiter::Suspend(InPromise);
 }
 
 void FDelegateAwaiter::Cancel(void* This, FPromise& Promise)
@@ -225,12 +227,5 @@ UObject* FDelegateAwaiter::SetupCallbackTarget(std::function<void(void*)> Fn)
 	auto* Target = NewObject<UUE5CoroDelegateCallbackTarget>();
 	Target->SetInternalFlags(EInternalObjectFlags::Async);
 	Target->Init(std::move(Fn));
-	checkf(!Cleanup, TEXT("Internal error: double setup"));
-	Cleanup = [Target]
-	{
-		FGCScopeGuard _;
-		Target->ClearInternalFlags(EInternalObjectFlags::Async);
-		Target->MarkAsGarbage();
-	};
 	return Target;
 }

@@ -297,14 +297,13 @@ struct TAwaitTransform<P, TFuture<T>>
 	TFutureAwaiter<T> operator()(TFuture<T>&) = delete;
 };
 
-template<typename>
-struct TDelegateAwaiterFor;
-template<typename T, typename R, typename... A>
-struct TDelegateAwaiterFor<R (T::*)(A...) const>
+template<typename D, typename T, typename R, typename... A>
+struct TDelegateAwaiterFor<D, R (T::*)(A...) const>
 {
-	using type = std::conditional_t<TIsDynamicDelegate<T>,
-	                                TDynamicDelegateAwaiter<R, A...>,
-	                                TDelegateAwaiter<R, A...>>;
+	static_assert(TIsDynamicDelegate<D> == TIsDynamicDelegate<T>);
+	using type = std::conditional_t<TIsDynamicDelegate<D>,
+	                                TDynamicDelegateAwaiter<D, R, A...>,
+	                                TDelegateAwaiter<D, R, A...>>;
 };
 
 template<typename P, TIsDelegate T>
@@ -323,7 +322,7 @@ struct TAwaitTransform<P, T>
 		else
 			return &T::Execute;
 	}
-	using FAwaiter = typename TDelegateAwaiterFor<decltype(ExecutePtr())>::type;
+	using FAwaiter = typename TDelegateAwaiterFor<T, decltype(ExecutePtr())>::type;
 
 	FAwaiter operator()(T& Delegate) { return FAwaiter(Delegate); }
 
@@ -386,15 +385,14 @@ public:
 class [[nodiscard]] UE5CORO_API FDelegateAwaiter
 	: public TCancelableAwaiter<FDelegateAwaiter>
 {
-	static void Cancel(void*, FPromise&);
-
-protected:
 	std::atomic<FPromise*> Promise = nullptr;
+	std::function<void()> (*Prepare)(FDelegateAwaiter*);
 	std::function<void()> Cleanup;
 
-	FDelegateAwaiter();
+protected:
+	explicit FDelegateAwaiter(std::function<void()> (*)(FDelegateAwaiter*));
 	void Resume();
-	UObject* SetupCallbackTarget(std::function<void(void*)>);
+	static UObject* SetupCallbackTarget(std::function<void(void*)>);
 
 public:
 	UE_NONCOPYABLE(FDelegateAwaiter);
@@ -402,43 +400,24 @@ public:
 	~FDelegateAwaiter();
 #endif
 	void Suspend(FPromise& InPromise);
+
+private:
+	static void Cancel(void*, FPromise&);
 };
 
-template<typename R, typename... A>
-class [[nodiscard]] TDelegateAwaiter : public FDelegateAwaiter
+template<typename T, typename R, typename... A>
+class [[nodiscard]] TDelegateAwaiter final : public FDelegateAwaiter
 {
+	static_assert(!TIsDynamicDelegate<T>);
 	using ThisClass = TDelegateAwaiter;
 	using FResult = std::conditional_t<sizeof...(A) != 0, TTuple<A...>, void>;
+	T& Delegate;
 	TTuple<A...>* Result = nullptr;
 
 public:
-	template<typename T>
 	explicit TDelegateAwaiter(T& Delegate)
-	{
-		static_assert(!TIsDynamicDelegate<T>);
-		if constexpr (TIsMulticastDelegate<T>)
-		{
-			auto Handle = Delegate.AddRaw(this,
-			                              &ThisClass::template ResumeWith<A...>);
-			Cleanup = [Handle, &Delegate] { Delegate.Remove(Handle); };
-		}
-		else
-		{
-			Delegate.BindRaw(this, &ThisClass::template ResumeWith<A...>);
-			Cleanup = [&Delegate] { Delegate.Unbind(); };
-		}
-	}
+		: FDelegateAwaiter(&Prepare), Delegate(Delegate) { }
 	UE_NONCOPYABLE(TDelegateAwaiter);
-
-	template<typename... T>
-	R ResumeWith(T... Args)
-	{
-		TTuple<T...> Values(std::forward<T>(Args)...);
-		Result = &Values; // This exposes a pointer to a local, but...
-		Resume(); // ...it's only read by await_resume, right here
-		// The coroutine might have completed, destroying this object
-		return R();
-	}
 
 	FResult await_resume()
 	{
@@ -446,42 +425,50 @@ public:
 		if constexpr (sizeof...(A) != 0)
 			return std::move(*Result);
 	}
+
+private:
+	static std::function<void()> Prepare(FDelegateAwaiter* Super)
+	{
+		auto* This = static_cast<ThisClass*>(Super);
+		if constexpr (TIsMulticastDelegate<T>)
+		{
+			auto Handle = This->Delegate.AddRaw(
+				This, &ThisClass::template ResumeWith<A...>);
+			return [This, Handle] { This->Delegate.Remove(Handle); };
+		}
+		else
+		{
+			This->Delegate.BindRaw(This, &ThisClass::template ResumeWith<A...>);
+			return [This] { This->Delegate.Unbind(); };
+		}
+	}
+
+	template<typename... P>
+	R ResumeWith(P... Args) // Intentionally not P&&
+	{
+		TTuple<P...> Values(std::forward<P>(Args)...);
+		Result = &Values; // This exposes a pointer to a local, but...
+		Resume(); // ...it's only read by await_resume, right here
+		// The coroutine might have completed, destroying this object
+		return R();
+	}
 };
 
-template<typename R, typename... A>
-class [[nodiscard]] TDynamicDelegateAwaiter : public FDelegateAwaiter
+template<typename T, typename R, typename... A>
+class [[nodiscard]] TDynamicDelegateAwaiter final : public FDelegateAwaiter
 {
+	static_assert(TIsDynamicDelegate<T>);
+	using ThisClass = TDynamicDelegateAwaiter;
 	using FResult = std::conditional_t<sizeof...(A) != 0,
 	                                   TDecayedPayload<A...>&, void>;
 	using FPayload = std::conditional_t<std::is_void_v<R>, TDecayedPayload<A...>,
 	                                    TDecayedPayload<A..., R>>;
-	TDecayedPayload<A...>* Result; // Missing R, for the coroutine
+	T& Delegate;
+	TDecayedPayload<A...>* Result = nullptr; // Missing R, for the coroutine
 
 public:
-	template<typename T>
-	explicit TDynamicDelegateAwaiter(T& InDelegate)
-	{
-		static_assert(TIsDynamicDelegate<T>);
-		// SetupCallbackTarget sets Cleanup and ties Target's lifetime to this
-		auto* Target = SetupCallbackTarget([this](void* Params)
-		{
-			// This matches the hack in TBaseUFunctionDelegateInstance::Execute
-			Result = static_cast<TDecayedPayload<A...>*>(Params);
-			Resume();
-			// The coroutine might have completed, deleting the awaiter
-			if constexpr (!std::is_void_v<R>)
-				static_cast<FPayload*>(Params)->template get<sizeof...(A)>() = R();
-		});
-
-		if constexpr (TIsMulticastDelegate<T>)
-		{
-			FScriptDelegate Delegate;
-			Delegate.BindUFunction(Target, NAME_Core);
-			InDelegate.Add(Delegate);
-		}
-		else
-			InDelegate.BindUFunction(Target, NAME_Core);
-	}
+	explicit TDynamicDelegateAwaiter(T& Delegate)
+		: FDelegateAwaiter(&Prepare), Delegate(Delegate) { }
 	UE_NONCOPYABLE(TDynamicDelegateAwaiter);
 
 	FResult await_resume()
@@ -491,6 +478,37 @@ public:
 			checkf(Result, TEXT("Internal error: resumed without a result"));
 			return *Result;
 		}
+	}
+
+private:
+	static std::function<void()> Prepare(FDelegateAwaiter* Super)
+	{
+		auto* This = static_cast<ThisClass*>(Super);
+		auto* Target = This->SetupCallbackTarget([This](void* Params)
+		{
+			// This matches the hack in TBaseUFunctionDelegateInstance::Execute
+			This->Result = static_cast<TDecayedPayload<A...>*>(Params);
+			This->Resume();
+			// The coroutine might have completed, deleting the awaiter
+			if constexpr (!std::is_void_v<R>)
+				static_cast<FPayload*>(Params)->template get<sizeof...(A)>() = R();
+		});
+
+		if constexpr (TIsMulticastDelegate<T>)
+		{
+			FScriptDelegate Delegate;
+			Delegate.BindUFunction(Target, NAME_Core);
+			This->Delegate.Add(Delegate);
+		}
+		else
+			This->Delegate.BindUFunction(Target, NAME_Core);
+
+		return [Target]
+		{
+			FGCScopeGuard _;
+			Target->ClearInternalFlags(EInternalObjectFlags::Async);
+			Target->MarkAsGarbage();
+		};
 	}
 };
 }
